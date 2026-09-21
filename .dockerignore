@@ -1,0 +1,24 @@
+# 虚拟环境 —— Windows 版依赖在 Linux 容器内不可用，且镜像会重新安装
+.venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 版本控制
+.git/
+.gitignore
+
+# 密钥与本地配置 —— 绝不能进入镜像层
+.env
+.env.bak
+
+# 文档与笔记
+docs/
+notes/
+*.md
+
+# 编辑器
+.vscode/
+.idea/

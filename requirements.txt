@@ -1,0 +1,7 @@
+# 运行依赖 —— 版本与本地 .venv 实际安装保持一致
+# 核对命令：pip freeze | Select-String -Pattern "fastapi|uvicorn|pydantic|httpx|starlette"
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+httpx2==2.13.0
