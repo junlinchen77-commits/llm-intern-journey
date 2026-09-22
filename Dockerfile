@@ -13,8 +13,7 @@ WORKDIR /app
 
 # ---------- 依赖层（独立且靠前，便于缓存复用）----------
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # ---------- 代码层 ----------
 COPY src/ ./src/
@@ -23,7 +22,8 @@ COPY src/ ./src/
 EXPOSE 8000
 
 # 以非 root 用户运行，降低容器逃逸后的影响面
-RUN useradd --create-home --shell /bin/bash appuser
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
 USER appuser
 
 CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
