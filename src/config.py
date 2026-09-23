@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     )
 
     # --- LLM API ---
+    llm_trust_env: bool = Field(
+        default=True,
+        description="是否读取环境中的代理设置。"
+        "企业内网依赖代理时必须为 True（默认）；"
+        "若本地代理干扰调试可设为 False。",
+    )
     llm_api_key: SecretStr = Field(
         description="LLM 服务商的 API 密钥。使用 SecretStr 避免日志意外打印明文。"
     )

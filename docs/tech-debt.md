@@ -56,3 +56,44 @@
 | `dubious ownership` | 目录所有者是 Administrators | `git config --global --add safe.directory`（不用 `*`） |
 | 500 错误无信息 | 浏览器只显示通用文案 | **原因永远在服务端日志**（`ResponseValidationError` 等） |
 | 404 而非 500 | 丢失 `@app.get` 装饰器 | 函数存在 ≠ 路由已注册；查 `/docs` 是否列出该接口 |
+
+
+
+## 5. 本地环境:代理静默介入 HTTP 请求
+
+- **现象**：本机 `httpx2.Client()`（默认 `trust_env=True`）请求
+  `http://127.0.0.1:8000/health` 返回 **502**，而 `trust_env=False` 返回 200。
+  同一环境下 `os.environ` 无任何代理变量、`netsh winhttp show proxy`
+  显示 Direct access、注册表 `ProxyEnable=0x0`（但 `ProxyServer` 仍保留
+  `127.0.0.1:7897`，且该端口有 Clash 在监听）。
+- **影响**：代码行为隐式依赖运行环境的网络配置；本地走代理、云端直连，
+  同一份代码在两处行为不一致。
+- **已处理**：新增配置项 `LLM_TRUST_ENV`，默认 `true` 保持标准行为
+  （企业内网依赖代理），本地设为 `false` 直连。
+- **未查明**：代理信息的具体读取来源（环境变量、WinHTTP、注册表均已排除）。
+  判定为纯本地环境问题，不影响云端部署，暂不深究。
+
+## 6. 模型输出未经净化，前端渲染需注意 XSS
+
+- **现象**：`POST /chat` 的 `reply` 字段中出现了模型生成的 HTML 标签
+  （如 `<font color="#1e40af">`）。
+- **风险**：模型输出属于**不可信输入**。若前端以 `innerHTML` 直接插入，
+  会引入 XSS。当前接口只返回纯文本 JSON，风险在前端。
+- **修法**：前端使用 `textContent` 而非 `innerHTML`；或对模型输出做
+  HTML 净化（如 DOMPurify）。若本项目后续提供 Web 界面，需先处理此项。
+
+## 7. 每个请求新建 LLMClient，TLS 握手开销重复
+
+- **现象**：`app.py` 的 `/chat` 每次请求都 `LLMClient()` 并在 `finally`
+  中 `close()`，连接池无法复用。
+- **影响**：每次请求都付出一次 TLS 握手成本（约 100–300ms）。功能正确，
+  但高并发下延迟明显。
+- **修法**：改为应用级单例，用 FastAPI 的 `lifespan` 在启动时创建、
+  关闭时释放，请求内通过 `request.app.state` 复用。
+
+## 8. 重试退避参数不可注入，导致测试变慢
+
+- **现象**：`tests/test_llm_client.py` 运行约 7.8 秒，绝大部分时间消耗在
+  重试的 `time.sleep` 上；13 个测试中有 6 个触发了真实等待。
+- **修法**：把 `_BACKOFF_BASE_SECONDS` 等参数改为可注入（构造参数或依赖注入），
+  测试中传 0，生产用默认值。

@@ -1,17 +1,28 @@
+
+
 """FastAPI 应用入口。
 
-把本地模块（token_estimator）暴露为 HTTP 接口。
+把本地模块（token_estimator、llm_client）暴露为 HTTP 接口。
 """
 
 from typing import Annotated
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import Field
 
-from src.models import HealthResponse, TokenCountResponse
+from src.exceptions import LLMCallError, LLMError, LLMResponseError
+from src.llm_client import LLMClient
+from src.models import (
+    ChatRequest,
+    ChatResponse,
+    ChatUsage,
+    HealthResponse,
+    TokenCountResponse,
+)
 from src.token_estimator import estimate_tokens
 
-app = FastAPI(title="LLM Intern Journey API", version="0.1.0")
+app = FastAPI(title="LLM Intern Journey API", version="0.2.0")
+
 
 
 @app.get("/health")
@@ -47,3 +58,49 @@ def token_count(
         TokenCountResponse: 含 tokens 字段的响应模型。
     """
     return TokenCountResponse(tokens=estimate_tokens(text.strip()))
+
+
+@app.post("/chat")
+def chat(payload: ChatRequest) -> ChatResponse:
+    """调用大模型生成回复。
+
+    错误映射遵循「客户端错误 vs 服务端错误」的区分：
+      - 重试耗尽的临时故障（限流、上游 5xx）→ 503，调用方可稍后重试
+      - 请求被模型服务商拒绝（4xx）→ 502，重试无意义
+      - 响应结构异常 → 502，属上游契约问题
+    """
+    client = LLMClient()
+    try:
+        result = client.chat(
+            payload.message,
+            system=payload.system,
+            temperature=payload.temperature,
+        )
+    except LLMCallError as exc:
+        if exc.retryable:
+            raise HTTPException(
+                status_code=503,
+                detail=f"模型服务暂时不可用（已尝试 {exc.attempts} 次），请稍后重试",
+            ) from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"模型服务拒绝了请求（HTTP {exc.status_code}）",
+        ) from exc
+    except LLMResponseError as exc:
+        raise HTTPException(status_code=502, detail="模型响应格式异常") from exc
+    except LLMError as exc:
+        raise HTTPException(status_code=500, detail="模型调用发生内部错误") from exc
+    finally:
+        client.close()
+
+    return ChatResponse(
+        reply=result.content,
+        model=result.model,
+        usage=ChatUsage(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            total_tokens=result.usage.total_tokens,
+        ),
+        attempts=result.attempts,
+        request_id=result.request_id,
+    )
