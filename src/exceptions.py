@@ -38,3 +38,12 @@ class LLMCallError(LLMError):
 
 class LLMResponseError(LLMError):
     """响应格式不符合预期（能连通但返回内容无法解析）。"""
+
+
+class LLMStreamInterruptedError(LLMError):
+    """流式响应中途断开。
+
+    与 LLMCallError 的区别：此类错误发生在已经产出部分内容之后，
+    重试会导致重复内容，因此不自动重试。由调用方决定如何处理，
+    例如保留已收到的部分并提示用户重新发起请求。
+    """

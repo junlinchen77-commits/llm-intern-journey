@@ -4,6 +4,8 @@
 类型校验、自动文档、示例值都由模型定义生成。
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -18,14 +20,38 @@ class TokenCountResponse(BaseModel):
 
     tokens: int = Field(description="估算出的 token 数量", examples=[4])
 
+class ChatMessage(BaseModel):
+    """一条对话消息。"""
+
+    role: Literal["system", "user", "assistant"] = Field(
+        description="消息角色。system 设定行为，user 是用户输入，assistant 是模型的历史回复。"
+    )
+    content: str = Field(
+        min_length=1,
+        max_length=8_000,
+        description="消息内容。",
+        examples=["你好"],
+    )
+
+
 class ChatRequest(BaseModel):
-    """对话请求。"""
+    """对话请求。
+
+    多轮对话由调用方维护完整历史并每次全量传入，服务端不保存会话状态——
+    这样任意实例都能处理任意请求，便于水平扩展。
+    """
 
     message: str = Field(
         min_length=1,
         max_length=8_000,
         description="用户消息内容。",
         examples=["用一句话解释什么是 RAG"],
+    )
+    history: list[ChatMessage] = Field(
+        default_factory=list,
+        max_length=200,
+        description="历史消息列表，按时间顺序排列，不含本次 message。"
+        "服务端会拼成 [system?] + history + [user message] 后发给模型。",
     )
     system: str | None = Field(
         default=None,

@@ -1,9 +1,10 @@
 """LLMClient 单元测试。
 
-用 mock transport 构造失败场景，不依赖真实网络与 API 额度，
+用 mock transport 构造失败与流式场景，不依赖真实网络与 API 额度，
 因此结果完全确定，可在 CI 中运行。
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -12,13 +13,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import httpx2
 
 from src.exceptions import LLMCallError, LLMResponseError
-from src.llm_client import LLMClient, TokenUsage
+from src.llm_client import ChatStreamChunk, LLMClient, TokenUsage
 
 MOCK_SUCCESS_BODY = {
     "model": "mock-model",
     "choices": [{"message": {"role": "assistant", "content": "成功"}}],
     "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
 }
+
+
+def _sse_body(
+    deltas: list[str],
+    *,
+    usage: dict | None = None,
+    model: str = "mock-model",
+) -> bytes:
+    """构造 OpenAI 兼容的 SSE 响应体。"""
+    lines: list[str] = []
+    for delta in deltas:
+        event = {
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": delta}}],
+        }
+        lines.append(f"data: {json.dumps(event)}\n\n")
+    if usage is not None:
+        # 用量通常作为独立事件出现在末尾，choices 为空
+        lines.append(
+            f"data: {json.dumps({'model': model, 'choices': [], 'usage': usage})}\n\n"
+        )
+    lines.append("data: [DONE]\n\n")
+    return "".join(lines).encode("utf-8")
 
 
 class ScriptedTransport(httpx2.BaseTransport):
@@ -28,6 +52,7 @@ class ScriptedTransport(httpx2.BaseTransport):
         fail_times: 前多少次请求失败。
         status_on_fail: 非 None 时返回该状态码；None 时抛 ConnectError。
         body: 成功时返回的 JSON。
+        sse_body: 非 None 时成功响应改为带该字节流（用于流式测试）。
     """
 
     def __init__(
@@ -36,36 +61,53 @@ class ScriptedTransport(httpx2.BaseTransport):
         *,
         status_on_fail: int | None = None,
         body: dict | None = None,
+        sse_body: bytes | None = None,
     ) -> None:
         self.fail_times = fail_times
         self.status_on_fail = status_on_fail
         self.body = body if body is not None else MOCK_SUCCESS_BODY
+        self.sse_body = sse_body
         self.call_count = 0
+        self.seen_keys: list[str] = []
+        self.seen_payloads: list[dict] = []
 
     def handle_request(self, request: httpx2.Request) -> httpx2.Response:
         self.call_count += 1
+        self.seen_keys.append(request.headers.get("Idempotency-Key", ""))
+        if request.content:
+            try:
+                self.seen_payloads.append(json.loads(request.content))
+            except ValueError:
+                pass
+
         if self.call_count <= self.fail_times:
             if self.status_on_fail is not None:
                 return httpx2.Response(
                     self.status_on_fail, text="upstream error", request=request
                 )
             raise httpx2.ConnectError("simulated failure", request=request)
+
+        if self.sse_body is not None:
+            return httpx2.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=httpx2.ByteStream(self.sse_body),
+                request=request,
+            )
         return httpx2.Response(200, json=self.body, request=request)
 
 
-def make_client(transport: httpx2.BaseTransport, **kwargs) -> LLMClient:
+def make_client(transport: httpx2.BaseTransport) -> LLMClient:
     """构造注入了 mock transport 的客户端。
 
     通过替换内部 client 避免真实网络；这是测试专用做法，
     生产代码不应访问私有属性。
     """
     client = LLMClient()
-    client._client.close()
     client._client = httpx2.Client(
         base_url="http://mock.local/v1",
         transport=transport,
         headers={"Authorization": "Bearer mock"},
-        **kwargs,
     )
     return client
 
@@ -101,7 +143,6 @@ def test_chat_success_parses_content_and_usage():
     assert result.usage.total_tokens == 4
     assert result.attempts == 1
     assert transport.call_count == 1
-    client.close()
 
 
 def test_chat_recovers_after_transient_network_failure():
@@ -113,7 +154,6 @@ def test_chat_recovers_after_transient_network_failure():
     assert result.content == "成功"
     assert result.attempts == 3
     assert transport.call_count == 3
-    client.close()
 
 
 # ----------------------------------------------------------------------
@@ -133,7 +173,6 @@ def test_empty_message_rejected_without_any_request():
         assert exc.attempts == 1
 
     assert transport.call_count == 0
-    client.close()
 
 
 def test_negative_max_retries_rejected():
@@ -145,7 +184,30 @@ def test_negative_max_retries_rejected():
     except LLMCallError as exc:
         assert exc.retryable is False
     assert transport.call_count == 0
-    client.close()
+
+
+def test_invalid_role_rejected_without_request():
+    """非法 role 应在发请求前被拦下，错误信息需指出下标。"""
+    transport = ScriptedTransport(fail_times=0)
+    client = make_client(transport)
+    try:
+        client.chat_messages([{"role": "robot", "content": "你好"}])
+        raise AssertionError("应当抛出 LLMCallError")
+    except LLMCallError as exc:
+        assert "messages[0].role" in str(exc)
+        assert exc.retryable is False
+    assert transport.call_count == 0
+
+
+def test_empty_messages_rejected():
+    transport = ScriptedTransport(fail_times=0)
+    client = make_client(transport)
+    try:
+        client.chat_messages([])
+        raise AssertionError("应当抛出 LLMCallError")
+    except LLMCallError as exc:
+        assert exc.retryable is False
+    assert transport.call_count == 0
 
 
 # ----------------------------------------------------------------------
@@ -162,7 +224,22 @@ def test_total_attempts_equals_one_plus_max_retries():
     except LLMCallError as exc:
         assert exc.attempts == 3
     assert transport.call_count == 3
-    client.close()
+
+
+def test_zero_max_retries_means_no_retry():
+    """max_retries=0 应被尊重为「不重试」，而不是回退到配置值。
+
+    这条锁住 _resolve_retries 里的 is None 判断：
+    若有人改成 `max_retries or 配置值`，0 会被替换成配置值，此测试即失败。
+    """
+    transport = ScriptedTransport(fail_times=99, status_on_fail=500)
+    client = make_client(transport)
+    try:
+        client.chat("你好", max_retries=0)
+        raise AssertionError("应当抛出 LLMCallError")
+    except LLMCallError as exc:
+        assert exc.attempts == 1
+    assert transport.call_count == 1
 
 
 def test_client_error_is_not_retried():
@@ -177,7 +254,6 @@ def test_client_error_is_not_retried():
         assert exc.status_code == 400
         assert exc.attempts == 1
     assert transport.call_count == 1
-    client.close()
 
 
 def test_rate_limit_is_retried():
@@ -192,7 +268,6 @@ def test_rate_limit_is_retried():
         assert exc.retryable is True
         assert exc.attempts == 3
     assert transport.call_count == 3
-    client.close()
 
 
 def test_network_error_preserves_cause_and_has_no_status_code():
@@ -205,7 +280,6 @@ def test_network_error_preserves_cause_and_has_no_status_code():
         assert exc.status_code is None
         assert exc.retryable is True
         assert isinstance(exc.__cause__, httpx2.ConnectError)
-    client.close()
 
 
 # ----------------------------------------------------------------------
@@ -221,7 +295,6 @@ def test_malformed_response_raises_response_error():
         raise AssertionError("应当抛出 LLMResponseError")
     except LLMResponseError:
         pass
-    client.close()
 
 
 # ----------------------------------------------------------------------
@@ -230,39 +303,146 @@ def test_malformed_response_raises_response_error():
 
 def test_idempotency_key_is_reused_across_retries():
     """重试必须复用同一幂等键，否则去重完全失效。"""
-    seen_keys: list[str] = []
-
-    class KeyCapturingTransport(httpx2.BaseTransport):
-        def handle_request(self, request: httpx2.Request) -> httpx2.Response:
-            seen_keys.append(request.headers.get("Idempotency-Key", ""))
-            if len(seen_keys) < 3:
-                raise httpx2.ConnectError("simulated", request=request)
-            return httpx2.Response(200, json=MOCK_SUCCESS_BODY, request=request)
-
-    transport = KeyCapturingTransport()
+    transport = ScriptedTransport(fail_times=2)
     client = make_client(transport)
     result = client.chat("你好", max_retries=3)
 
     assert result.attempts == 3
-    assert len(seen_keys) == 3
-    assert len(set(seen_keys)) == 1, f"重试时应复用同一键，实际={seen_keys}"
-    assert seen_keys[0] != ""
-    client.close()
+    assert len(transport.seen_keys) == 3
+    assert len(set(transport.seen_keys)) == 1, (
+        f"重试时应复用同一键，实际={transport.seen_keys}"
+    )
+    assert transport.seen_keys[0] != ""
 
 
 def test_explicit_idempotency_key_is_used():
-    seen_keys: list[str] = []
-
-    class KeyCapturingTransport(httpx2.BaseTransport):
-        def handle_request(self, request: httpx2.Request) -> httpx2.Response:
-            seen_keys.append(request.headers.get("Idempotency-Key", ""))
-            return httpx2.Response(200, json=MOCK_SUCCESS_BODY, request=request)
-
-    client = make_client(KeyCapturingTransport())
+    transport = ScriptedTransport(fail_times=0)
+    client = make_client(transport)
     result = client.chat("你好", idempotency_key="order-42")
     assert result.request_id == "order-42"
-    assert seen_keys == ["order-42"]
-    client.close()
+    assert transport.seen_keys == ["order-42"]
+
+
+# ----------------------------------------------------------------------
+# 多轮对话
+# ----------------------------------------------------------------------
+
+def test_build_messages_puts_system_first():
+    messages = LLMClient.build_messages("问题", system="你是助手")
+    assert messages == [
+        {"role": "system", "content": "你是助手"},
+        {"role": "user", "content": "问题"},
+    ]
+
+
+def test_build_messages_without_system():
+    assert LLMClient.build_messages("问题") == [{"role": "user", "content": "问题"}]
+
+
+def test_chat_messages_sends_history_in_order():
+    """历史消息应原样按顺序出现在请求体中，最后才是本次用户消息。"""
+    transport = ScriptedTransport(fail_times=0)
+    client = make_client(transport)
+    client.chat_messages([
+        {"role": "system", "content": "你是助手"},
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "第一答"},
+        {"role": "user", "content": "第二问"},
+    ])
+
+    sent = transport.seen_payloads[0]["messages"]
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "user"]
+    assert sent[-1]["content"] == "第二问"
+
+
+# ----------------------------------------------------------------------
+# 流式输出
+# ----------------------------------------------------------------------
+
+def collect_stream(client: LLMClient, **kwargs) -> list[ChatStreamChunk]:
+    return list(client.chat_stream([{"role": "user", "content": "你好"}], **kwargs))
+
+
+def test_chat_stream_yields_deltas_in_order():
+    transport = ScriptedTransport(
+        fail_times=0,
+        sse_body=_sse_body(
+            ["你", "好", "世界"],
+            usage={"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+        ),
+    )
+    client = make_client(transport)
+    chunks = collect_stream(client)
+
+    deltas = [c.delta for c in chunks if not c.is_final]
+    assert "".join(deltas) == "你好世界"
+    assert deltas == ["你", "好", "世界"], "应保持服务端返回的顺序"
+
+
+def test_chat_stream_marks_final_chunk_with_usage():
+    transport = ScriptedTransport(
+        fail_times=0,
+        sse_body=_sse_body(
+            ["a"],
+            usage={"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+        ),
+    )
+    client = make_client(transport)
+    chunks = collect_stream(client)
+
+    final = chunks[-1]
+    assert final.is_final is True
+    assert final.usage == TokenUsage(prompt_tokens=2, completion_tokens=3, total_tokens=5)
+    assert final.delta == ""
+    assert final.model == "mock-model"
+
+
+def test_chat_stream_sets_stream_flag_in_payload():
+    """流式请求必须在请求体里带 stream=true，否则服务端返回非流式响应。"""
+    transport = ScriptedTransport(fail_times=0, sse_body=_sse_body(["a"]))
+    client = make_client(transport)
+    collect_stream(client)
+
+    payload = transport.seen_payloads[0]
+    assert payload["stream"] is True
+    assert payload["stream_options"] == {"include_usage": True}
+
+
+def test_chat_stream_ignores_done_marker():
+    """data: [DONE] 是结束标记，不应被当成内容或导致解析错误。"""
+    transport = ScriptedTransport(fail_times=0, sse_body=_sse_body(["x"]))
+    client = make_client(transport)
+    chunks = collect_stream(client)
+
+    joined = "".join(c.delta for c in chunks)
+    assert "DONE" not in joined
+    assert joined == "x"
+
+
+def test_chat_stream_tolerates_malformed_event():
+    """单个事件 JSON 损坏时应跳过该事件，而不是中断整个流。"""
+    raw = (
+        'data: {"model":"m","choices":[{"delta":{"content":"A"}}]}\n\n'
+        "data: {not valid json}\n\n"
+        'data: {"model":"m","choices":[{"delta":{"content":"B"}}]}\n\n'
+        "data: [DONE]\n\n"
+    ).encode("utf-8")
+    transport = ScriptedTransport(fail_times=0, sse_body=raw)
+    client = make_client(transport)
+    chunks = collect_stream(client)
+
+    joined = "".join(c.delta for c in chunks)
+    assert joined == "AB"
+
+
+def test_chat_stream_retries_when_connect_fails_before_data():
+    """建流阶段失败可以重试：此时还没有产出任何内容。"""
+    transport = ScriptedTransport(fail_times=2, sse_body=_sse_body(["ok"]))
+    client = make_client(transport)
+    chunks = collect_stream(client, max_retries=3)
+
+    assert "".join(c.delta for c in chunks) == "ok"
+    assert transport.call_count == 3
 
 
 if __name__ == "__main__":
